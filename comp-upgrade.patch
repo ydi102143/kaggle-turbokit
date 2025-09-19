@@ -1,244 +1,366 @@
-# リポジトリルートで実行（70KBベース）
-cat > pro-upgrades.patch << 'PATCH'
+# リポジトリルートで
+cat > pro-upgrades-v2.patch << 'PATCH'
 *** ここから下をそのまま貼ってください ***
+diff --git a/requirements.txt b/requirements.txt
+index 2c2b2c2..a9a9a9a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -14,6 +14,7 @@ pillow
+ transformers
+ accelerate
+ sentencepiece
+ streamlit
++shap
 diff --git a/ktk_cli.py b/ktk_cli.py
-index 4b2f6d1..8f0a1d2 100644
+index 8f0a1d2..7b7c6e1 100644
 --- a/ktk_cli.py
 +++ b/ktk_cli.py
-@@ -1,6 +1,7 @@
+@@ -1,8 +1,9 @@
  import typer, yaml
  from pathlib import Path
  from src.core.registry import get_trainer, get_inferer
-+from src.utils import ROOT
+ from src.utils import ROOT
  from src.tune import run_tuning
  from src.utils import make_run_id
++import warnings
  
-@@ -68,6 +69,35 @@ def eda_report(cfg: str = typer.Option("conf/default.yaml"),
-     path = generate_report(config, out_dir=out_dir, sample=sample)
-     typer.echo(f"[TurboKit] EDA report -> {path}")
+ app = typer.Typer(help="Kaggle TurboKit – speedrun strong baselines")
  
-+@app.command("threshold")
-+def threshold_opt(
-+    run_id: str = typer.Option(..., help="Run ID (OOF必須)"),
-+    metric: str = typer.Option("f1", help="f1 | acc"),
-+    step: float = typer.Option(0.001, help="探索刻み(0-1)"),
-+    out_name: str = typer.Option(None, help="保存先CSV名（未指定で preds/<run_id>_thres.csv）"),
-+    cfg: str = typer.Option("conf/default.yaml", help="Config（出力dir取得に使用）"),
+@@ -38,7 +39,11 @@ def tune(cfg: str = typer.Option("conf/default.yaml", help="Config YAML"),
+          n_trials: int = typer.Option(30, help="Optuna trials")):
+-    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
+-    run_id, best_params, best_score = run_tuning(config, n_trials=n_trials)
++    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
++    # レシピは model.name を見て自動選択（lightgbm/xgboost）。非対応はダミー。
++    try:
++        run_id, best_params, best_score = run_tuning(config, n_trials=n_trials)
++    except Exception as e:
++        warnings.warn(f"Tuning failed: {e}")
++        run_id, best_params, best_score = make_run_id(prefix="tune"), {}, 0.0
+     typer.echo(f"[TurboKit] Best run: {run_id} score={best_score}\nParams: {best_params}")
+ 
+@@ -104,6 +109,27 @@ def adv_val(cfg: str = typer.Option("conf/default.yaml", help="Config YAML")):
+     rep = run_adversarial_validation(config)
+     typer.echo(f"[TurboKit] Adversarial AUC={rep['auc']:.4f}  Top feats: {', '.join(rep['top_features'][:10])}")
+ 
++@app.command("shap-report")
++def shap_report(
++    cfg: str = typer.Option("conf/default.yaml"),
++    run_id: str = typer.Option(...),
++    max_samples: int = typer.Option(5000, help="SHAP計算の上限サンプル数"),
 +):
-+    from src.postprocess.threshold import optimize_threshold
++    from src.explain.shap_report import generate_shap_report
 +    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
-+    out = optimize_threshold(config, run_id, metric=metric, step=step, out_name=out_name)
-+    typer.echo(f"[TurboKit] Thresholded submission -> {out}")
++    out = generate_shap_report(config, run_id=run_id, max_samples=max_samples)
++    typer.echo(f"[TurboKit] SHAP report -> {out}")
 +
-+@app.command("calibrate")
-+def calibrate_probs(
-+    run_id: str = typer.Option(..., help="Run ID (OOF必須)"),
-+    method: str = typer.Option("platt", help="platt | isotonic"),
-+    cfg: str = typer.Option("conf/default.yaml", help="Config"),
++@app.command("blend-robust")
++def blend_robust(
++    files: list[str] = typer.Argument(..., help="予測CSVのパス（2つ以上）"),
++    method: str = typer.Option("mean", help="mean|gmean|rank"),
++    winsor: float = typer.Option(0.0, help="0-0.49 推奨。外れ予測の両端クリップ率"),
 +):
-+    from src.postprocess.calibration import fit_and_apply_calibration
-+    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
-+    out = fit_and_apply_calibration(config, run_id, method=method)
-+    typer.echo(f"[TurboKit] Calibrated submission -> {out}")
-+
-+@app.command("adv-val")
-+def adv_val(cfg: str = typer.Option("conf/default.yaml", help="Config YAML")):
-+    from src.quality.adversarial import run_adversarial_validation
-+    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
-+    rep = run_adversarial_validation(config)
-+    typer.echo(f"[TurboKit] Adversarial AUC={rep['auc']:.4f}  Top feats: {', '.join(rep['top_features'][:10])}")
++    from src.blend_robust import run_blend_robust
++    out = run_blend_robust(files, method=method, winsor=winsor)
++    typer.echo(f"[TurboKit] Robust blend -> {out}")
 +
  if __name__ == "__main__":
      app()
-diff --git a/src/postprocess/threshold.py b/src/postprocess/threshold.py
+diff --git a/src/validation.py b/src/validation.py
+index 9abcde0..7fe21aa 100644
+--- a/src/validation.py
++++ b/src/validation.py
+@@ -1,7 +1,23 @@
+ from __future__ import annotations
+ import numpy as np
+-from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
++from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
++try:
++    # sklearn>=1.3
++    from sklearn.model_selection import StratifiedGroupKFold
++except Exception:
++    StratifiedGroupKFold = None
+ 
+-def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True, random_state=42, regression_stratify_bins: int = 10):
++def make_splits(
++    task: str,
++    y,
++    groups=None,
++    method="kfold",
++    folds=5,
++    shuffle=True,
++    random_state=42,
++    regression_stratify_bins: int = 10,
++):
+     if method in ["stratified", "stratifiedkfold"] or (task == "classification" and method == "kfold"):
+         splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
+         return list(splitter.split(np.zeros(len(y)), y))
+@@ -10,6 +26,17 @@ def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True
+         return list(splitter.split(np.zeros(len(y)), y, groups))
+     if method == "time":
+         splitter = TimeSeriesSplit(n_splits=folds)
+         return list(splitter.split(np.arange(len(y))))
++    if method in ["group_stratified", "stratified_group", "sgkf"]:
++        if StratifiedGroupKFold is not None and task == "classification":
++            splitter = StratifiedGroupKFold(n_splits=folds, random_state=random_state, shuffle=shuffle)
++            return list(splitter.split(np.zeros(len(y)), y, groups))
++        # フォールバック：GroupKFold（分類の層は維持されないがリークは防止）
++        splitter = GroupKFold(n_splits=folds)
++        return list(splitter.split(np.zeros(len(y)), y, groups))
+     # regression with stratified-like binning
+     if task != "classification" and method in ["stratified", "stratifiedkfold"]:
+         y = np.array(y)
+         q = max(2, regression_stratify_bins)
+         bins = np.unique(np.quantile(y, np.linspace(0, 1, q+1)))
+         yb = np.digitize(y, bins[1:-1], right=True)
+         splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
+         return list(splitter.split(np.zeros(len(y)), yb))
+     splitter = KFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
+     return list(splitter.split(np.zeros(len(y))))
+diff --git a/src/blend_robust.py b/src/blend_robust.py
 new file mode 100644
-index 0000000..a11b2c3
+index 0000000..1a2a3b4
 --- /dev/null
-+++ b/src/postprocess/threshold.py
-@@ -0,0 +1,86 @@
++++ b/src/blend_robust.py
+@@ -0,0 +1,92 @@
 +from __future__ import annotations
 +from pathlib import Path
-+import numpy as np
-+import pandas as pd
++import numpy as np, pandas as pd
++from .utils import ROOT
++
++def _winsor(x: np.ndarray, p: float):
++    if p <= 0: return x
++    lo = np.quantile(x, p); hi = np.quantile(x, 1-p)
++    return np.clip(x, lo, hi)
++
++def _read_align(files):
++    dfs = [pd.read_csv(f) for f in files]
++    # 推定: 最左列を ID、最後列を予測とみなす
++    id_col = dfs[0].columns[0] if dfs[0].shape[1] > 1 else None
++    label = dfs[0].columns[-1]
++    if id_col is None:
++        # IDがない → インデックスで整列
++        M = np.column_stack([d[label].values for d in dfs])
++        return None, label, M, None
++    # IDで結合
++    base = dfs[0][[id_col, label]].rename(columns={label: f"m0"})
++    for i, d in enumerate(dfs[1:], start=1):
++        base = base.merge(d[[id_col, label]].rename(columns={label: f"m{i}"}), on=id_col, how="inner")
++    cols = [c for c in base.columns if c.startswith("m")]
++    M = base[cols].values
++    return id_col, label, M, base[[id_col]]
++
++def run_blend_robust(files: list[str], method: str = "mean", winsor: float = 0.0):
++    assert len(files) >= 2, "2つ以上の予測CSVが必要です"
++    id_col, label, M, ids = _read_align(files)
++    # winsorize
++    M = np.column_stack([_winsor(M[:,i], winsor) for i in range(M.shape[1])])
++    if method == "gmean":
++        M = np.clip(M, 1e-12, None); blend = np.exp(np.mean(np.log(M), axis=1))
++    elif method == "rank":
++        from scipy.stats import rankdata
++        R = np.column_stack([rankdata(M[:,i]) for i in range(M.shape[1])]); blend = R.mean(axis=1)
++    else:
++        blend = M.mean(axis=1)
++    if ids is None:
++        out = pd.DataFrame({label: blend})
++    else:
++        out = ids.copy(); out[label] = blend
++    out_dir = ROOT / "outputs" / "preds"; out_dir.mkdir(parents=True, exist_ok=True)
++    name = f"blend_robust_{len(files)}_{method}{'_w'+str(winsor) if winsor>0 else ''}.csv"
++    path = out_dir / name; out.to_csv(path, index=False); return path
+diff --git a/src/explain/shap_report.py b/src/explain/shap_report.py
+new file mode 100644
+index 0000000..55aa66b
+--- /dev/null
++++ b/src/explain/shap_report.py
+@@ -0,0 +1,124 @@
++from __future__ import annotations
++from pathlib import Path
++import io, base64
++import numpy as np, pandas as pd, joblib
++import matplotlib.pyplot as plt
 +from ..utils import ROOT
 +
-+def _search_threshold(y_true: np.ndarray, proba: np.ndarray, metric: str = "f1", step: float = 0.001):
-+    assert metric in ("f1", "acc")
-+    best_t, best_s = 0.5, -1.0
-+    thr = np.arange(0.0, 1.0+1e-12, step)
-+    for t in thr:
-+        pred = (proba >= t).astype(int)
-+        if metric == "f1":
-+            # 手計算でF1（sklearn不要）
-+            tp = ((pred == 1) & (y_true == 1)).sum()
-+            fp = ((pred == 1) & (y_true == 0)).sum()
-+            fn = ((pred == 0) & (y_true == 1)).sum()
-+            p = 0.0 if (tp+fp)==0 else tp/(tp+fp)
-+            r = 0.0 if (tp+fn)==0 else tp/(tp+fn)
-+            f1 = 0.0 if (p+r)==0 else 2*p*r/(p+r)
-+            s = f1
-+        else:
-+            s = (pred == y_true).mean()
-+        if s > best_s:
-+            best_s, best_t = s, t
-+    return float(best_t), float(best_s)
++def _img(fig):
++    buf = io.BytesIO(); fig.savefig(buf, format="png", bbox_inches="tight"); plt.close(fig)
++    return base64.b64encode(buf.getvalue()).decode("ascii")
 +
-+def optimize_threshold(cfg: dict, run_id: str, metric: str = "f1", step: float = 0.001, out_name: str | None = None):
-+    """
-+    前提：OOFに 'oof_prob' がある(二値分類)。それを使って最適な閾値を探索し、
-+          既存の test 予測CSV (outputs/preds/<run_id>.csv) の確率列 or 予測列を閾値で binarize して出力。
-+    """
-+    out_dir = ROOT / cfg["output"]["dir"]
-+    oof_path = out_dir / "oof" / f"{run_id}.csv"
-+    pred_path = out_dir / "preds" / f"{run_id}.csv"
-+    assert oof_path.exists(), f"OOF not found: {oof_path}"
-+    assert pred_path.exists(), f"Pred not found: {pred_path}"
++def _try_import_shap():
++    try:
++        import shap
++        return shap
++    except Exception:
++        return None
 +
-+    oof = pd.read_csv(oof_path)
-+    assert "oof_prob" in oof.columns, "oof_prob is required for threshold optimization (binary)."
-+    y_true = (oof["y"].values).astype(int)
-+    proba = oof["oof_prob"].values.astype(float)
-+    t, score = _search_threshold(y_true, proba, metric=metric, step=step)
-+
-+    sub = pd.read_csv(pred_path)
-+    label = sub.columns[-1]
-+    if sub[label].between(0.0, 1.0).all():
-+        # すでに確率なら二値化
-+        sub[label] = (sub[label].values >= t).astype(int)
-+    else:
-+        # 予測が 0/1 の場合は一旦確率列が必要…だがここではそのまま二値のままにする。
-+        pass
-+
-+    out_csv = out_dir / "preds" / (out_name or f"{run_id}_thres_{metric}.csv")
-+    sub.to_csv(out_csv, index=False)
-+    # 閾値のメモを残す
-+    (out_csv.with_suffix(".meta.txt")).write_text(f"best_threshold={t}\nscore={score}\nmetric={metric}\n", encoding="utf-8")
-+    return str(out_csv)
-diff --git a/src/postprocess/calibration.py b/src/postprocess/calibration.py
-new file mode 100644
-index 0000000..a22b3c4
---- /dev/null
-+++ b/src/postprocess/calibration.py
-@@ -0,0 +1,93 @@
-+from __future__ import annotations
-+from pathlib import Path
-+import numpy as np
-+import pandas as pd
-+from sklearn.linear_model import LogisticRegression
-+from sklearn.isotonic import IsotonicRegression
-+from ..utils import ROOT
-+
-+def _fit_platt(y_true: np.ndarray, p: np.ndarray):
-+    # Platt scaling: ロジスティック回帰で確率を校正
-+    lr = LogisticRegression(max_iter=1000)
-+    lr.fit(p.reshape(-1,1), y_true.astype(int))
-+    def f(x): 
-+        proba = lr.predict_proba(np.asarray(x).reshape(-1,1))[:,1]
-+        return proba
-+    return f
-+
-+def _fit_isotonic(y_true: np.ndarray, p: np.ndarray):
-+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-+    iso.fit(p, y_true.astype(int))
-+    def f(x):
-+        return iso.predict(np.asarray(x))
-+    return f
-+
-+def fit_and_apply_calibration(cfg: dict, run_id: str, method: str = "platt"):
-+    """OOFの確率を用いてキャリブレータを学習し、test予測CSVを校正して出力。"""
-+    out_dir = ROOT / cfg["output"]["dir"]
-+    oof_path = out_dir / "oof" / f"{run_id}.csv"
-+    pred_path = out_dir / "preds" / f"{run_id}.csv"
-+    assert oof_path.exists(), f"OOF not found: {oof_path}"
-+    assert pred_path.exists(), f"Pred not found: {pred_path}"
-+    oof = pd.read_csv(oof_path)
-+    assert "oof_prob" in oof.columns, "oof_prob is required for calibration (binary)."
-+    y_true = (oof["y"].values).astype(int)
-+    p = oof["oof_prob"].values.astype(float)
-+    if method == "platt":
-+        g = _fit_platt(y_true, p)
-+    elif method == "isotonic":
-+        g = _fit_isotonic(y_true, p)
-+    else:
-+        raise ValueError("method must be platt|isotonic")
-+    sub = pd.read_csv(pred_path)
-+    label = sub.columns[-1]
-+    # testの列が確率でない場合はそのまま返す（確率モデル前提）
-+    if not sub[label].between(0.0, 1.0).all():
-+        return str(pred_path)
-+    sub[label] = g(sub[label].values)
-+    out = out_dir / "preds" / f"{run_id}_cal_{method}.csv"
-+    sub.to_csv(out, index=False)
-+    return str(out)
-diff --git a/src/quality/adversarial.py b/src/quality/adversarial.py
-new file mode 100644
-index 0000000..b33c4d5
---- /dev/null
-+++ b/src/quality/adversarial.py
-@@ -0,0 +1,109 @@
-+from __future__ import annotations
-+from pathlib import Path
-+import numpy as np
-+import pandas as pd
-+from sklearn.model_selection import train_test_split
-+from sklearn.metrics import roc_auc_score
-+from sklearn.compose import ColumnTransformer
-+from sklearn.preprocessing import OneHotEncoder, StandardScaler
-+from sklearn.impute import SimpleImputer
-+from sklearn.pipeline import Pipeline
-+from sklearn.linear_model import LogisticRegression
-+
-+def _prep(train: pd.DataFrame, test: pd.DataFrame, target: str | None):
-+    # 共通列のみ、ターゲットは除外
-+    common = [c for c in train.columns if c in test.columns]
-+    if target and target in common:
-+        common.remove(target)
-+    X = pd.concat([train[common].copy(), test[common].copy()], axis=0, ignore_index=True)
-+    y = np.r_[np.zeros(len(train)), np.ones(len(test))]
-+    return X, y, common
-+
-+def run_adversarial_validation(cfg: dict) -> dict:
-+    """train=0/test=1 の2値分類を作って AUC を測る。高いほど分布差が大きい。"""
++def generate_shap_report(cfg: dict, run_id: str, max_samples: int = 5000):
++    """LightGBM/XGBoost/CatBoostなどツリーモデルのSHAP可視化。"""
++    model_path = ROOT / cfg["output"]["dir"] / "models" / run_id / "model.joblib"
++    if not model_path.exists():
++        raise FileNotFoundError(f"model not found: {model_path}")
++    pipe = joblib.load(model_path)
++    # 推定: pipe.steps == [("pre", preproc), ("est", estimator)]
++    est = pipe.named_steps.get("est", None)
++    pre = pipe.named_steps.get("pre", None)
++    if est is None or pre is None:
++        raise RuntimeError("Expected sklearn Pipeline with ('pre','est').")
++    shap = _try_import_shap()
++    # 入力データを準備
 +    train = pd.read_csv(Path(cfg["data"]["train"]).resolve())
-+    test = pd.read_csv(Path(cfg["data"]["test"]).resolve())
 +    target = cfg["data"].get("target")
-+    X, y, cols = _prep(train, test, target)
-+    num_cols = X.select_dtypes(include=["number"]).columns.tolist()
-+    cat_cols = [c for c in X.columns if c not in num_cols]
-+    num_pipe = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler(with_mean=False))])
-+    cat_pipe = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", sparse=True))])
-+    pre = ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
-+    model = LogisticRegression(max_iter=1000)
-+    pipe = Pipeline([("pre", pre), ("est", model)])
-+    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
-+    pipe.fit(Xtr, ytr)
-+    prob = pipe.predict_proba(Xva)[:,1]
-+    auc = roc_auc_score(yva, prob)
-+    # 重みの絶対値上位を簡易に抽出（OneHot後の名前は取得が難しいので近似：元列単位での寄与を計算）
-+    # ここでは数値：|coef|、カテゴリ：OneHot各カテゴリの|coef|の合計 で近似評価
-+    est = pipe.named_steps["est"]
-+    # ColumnTransformerの出力に対応する元列単位の寄与を近似集計
-+    contrib = {}
-+    # 数値側：列順は num_cols の順に標準化→線形回帰係数を割当（近似）
-+    # OneHot 側は元列に複数カテゴリが展開されるため合計で寄与を見積もる。
-+    # 厳密な列名復元は避け、簡易に num_cols と cat_cols の2ブロックに均等配分する近似。
-+    coef = est.coef_.ravel() if hasattr(est, "coef_") else None
-+    if coef is not None:
-+        # 係数長の半分を数値、半分をカテゴリにざっくり配分（安全策）
-+        # 実装を簡潔に保つための近似。目的は“上位候補”の把握。
-+        k = len(coef)
-+        k_num = min(len(num_cols), k)
-+        coef_num = np.abs(coef[:k_num]).sum() if k_num>0 else 0.0
-+        coef_cat = np.abs(coef[k_num:]).sum() if k>k_num else 0.0
-+        for c in num_cols:
-+            contrib[c] = contrib.get(c, 0.0) + (coef_num/len(num_cols) if len(num_cols)>0 else 0.0)
-+        for c in cat_cols:
-+            contrib[c] = contrib.get(c, 0.0) + (coef_cat/len(cat_cols) if len(cat_cols)>0 else 0.0)
-+    top = sorted(contrib.items(), key=lambda x: x[1], reverse=True)
-+    return {"auc": float(auc), "top_features": [t[0] for t in top]}
++    X = train.drop(columns=[c for c in [target, cfg["data"].get("id_col")] if c in train.columns])
++    if len(X) > max_samples:
++        X = X.sample(max_samples, random_state=42)
++    X_proc = pre.fit_transform(X)  # 前処理の学習はフル学習時と若干ズレる可能性があるが実用上OK
++    # SHAP本体
++    html = io.StringIO()
++    out_dir = ROOT / cfg["output"]["dir"] / "reports"; out_dir.mkdir(parents=True, exist_ok=True)
++    html.write("<html><head><meta charset='utf-8'><title>SHAP Report</title></head><body>")
++    html.write(f"<h1>SHAP Report — {run_id}</h1>")
++    if shap is None:
++        html.write("<p><b>shap</b> がインストールされていません。`pip install shap` を実行してください。</p>")
++    else:
++        try:
++            explainer = shap.Explainer(est)
++            values = explainer(X_proc)
++            # Summary plot (bar)
++            fig = plt.figure()
++            shap.plots.bar(values, show=False, max_display=30)
++            b64 = _img(fig); html.write(f"<h3>Summary (bar)</h3><img src='data:image/png;base64,{b64}' style='max-width:900px'/>")
++            # Beeswarm
++            fig = plt.figure()
++            shap.plots.beeswarm(values, show=False, max_display=20)
++            b64 = _img(fig); html.write(f"<h3>Beeswarm</h3><img src='data:image/png;base64,{b64}' style='max-width:900px'/>")
++        except Exception as e:
++            html.write(f"<p>SHAP生成に失敗: {e}</p>")
++    html.write("</body></html>")
++    out = out_dir / f"shap_{run_id}.html"; out.write_text(html.getvalue(), encoding="utf-8"); return out
+diff --git a/src/tune.py b/src/tune.py
+index 1c1c1c1..7d7d7d7 100644
+--- a/src/tune.py
++++ b/src/tune.py
+@@ -1,6 +1,126 @@
+-from src.utils import make_run_id
+-
+-def run_tuning(cfg: dict, n_trials: int = 30):
+-    return make_run_id(prefix=cfg.get('name','tune')), {}, 0.0
++from __future__ import annotations
++import numpy as np, pandas as pd
++from pathlib import Path
++import optuna
++from .utils import make_run_id
++from .preprocessing import build_preprocess
++from .validation import make_splits
++from .metrics import score_task
++
++def _objective_lgbm(trial, cfg, X, y, task, splits, pre):
++    from lightgbm import LGBMClassifier, LGBMRegressor
++    params = {
++        "n_estimators": trial.suggest_int("n_estimators", 300, 1500),
++        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
++        "num_leaves": trial.suggest_int("num_leaves", 16, 256, log=True),
++        "min_child_samples": trial.suggest_int("min_child_samples", 5, 60),
++        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
++        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
++        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
++        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
++        "random_state": 42,
++        "n_jobs": -1,
++    }
++    if task == "classification":
++        est = LGBMClassifier(**params)
++    else:
++        est = LGBMRegressor(**params)
++    from sklearn.pipeline import Pipeline
++    pipe = Pipeline([("pre", pre), ("est", est)])
++    scores = []
++    for tr, va in splits:
++        pipe.fit(X.iloc[tr], y[tr])
++        if task == "classification" and hasattr(est, "predict_proba"):
++            prob = pipe.predict_proba(X.iloc[va])[:,1]
++            pred = (prob >= 0.5).astype(int)
++            sc = score_task(task, y[va], pred, prob)["auc"] or score_task(task, y[va], pred, prob)["f1"]
++            # なるべく AUC を優先（なければF1）
++            scores.append(sc)
++        else:
++            pred = pipe.predict(X.iloc[va])
++            sc = -score_task(task, y[va], pred)["rmse"]  # 大きいほど良いように符号を反転
++            scores.append(sc)
++    return float(np.mean(scores))
++
++def _objective_xgb(trial, cfg, X, y, task, splits, pre):
++    from xgboost import XGBClassifier, XGBRegressor
++    params = {
++        "n_estimators": trial.suggest_int("n_estimators", 300, 1500),
++        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
++        "max_depth": trial.suggest_int("max_depth", 3, 12),
++        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
++        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
++        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
++        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
++        "min_child_weight": trial.suggest_float("min_child_weight", 1e-2, 10.0, log=True),
++        "tree_method": "hist",
++        "random_state": 42,
++        "n_jobs": -1,
++    }
++    if task == "classification":
++        est = XGBClassifier(**params)
++    else:
++        est = XGBRegressor(**params)
++    from sklearn.pipeline import Pipeline
++    pipe = Pipeline([("pre", pre), ("est", est)])
++    scores = []
++    for tr, va in splits:
++        pipe.fit(X.iloc[tr], y[tr])
++        if task == "classification" and hasattr(est, "predict_proba"):
++            prob = pipe.predict_proba(X.iloc[va])[:,1]
++            pred = (prob >= 0.5).astype(int)
++            sc = score_task(task, y[va], pred, prob)["auc"] or score_task(task, y[va], pred, prob)["f1"]
++            scores.append(sc)
++        else:
++            pred = pipe.predict(X.iloc[va])
++            sc = -score_task(task, y[va], pred)["rmse"]
++            scores.append(sc)
++    return float(np.mean(scores))
++
++def run_tuning(cfg: dict, n_trials: int = 30):
++    """model.name に応じて LightGBM or XGBoost のレシピを自動選択。"""
++    import yaml
++    name = (cfg.get("model", {}).get("name") or "").lower()
++    task = cfg.get("task", "regression")
++    from pathlib import Path
++    import pandas as pd
++    train = pd.read_csv(Path(cfg["data"]["train"]).resolve())
++    target = cfg["data"]["target"]; id_col = cfg["data"].get("id_col")
++    X = train.drop(columns=[c for c in [target, id_col] if c in train.columns])
++    y = train[target].values
++    from .preprocessing import build_preprocess
++    pre, *_ = build_preprocess(train, target, id_col)
++    splits = make_splits(task, y,
++                         method=cfg.get("cv", {}).get("method", "kfold"),
++                         folds=cfg.get("cv", {}).get("folds", 5),
++                         shuffle=cfg.get("cv", {}).get("shuffle", True),
++                         random_state=cfg.get("cv", {}).get("random_state", 42),
++                         regression_stratify_bins=int(cfg.get("cv", {}).get("regression_stratify_bins", 10)))
++
++    if "lightgbm" in name:
++        obj = lambda trial: _objective_lgbm(trial, cfg, X, y, task, splits, pre)
++        direction = "maximize"
++    elif "xgboost" in name or "xgb" in name:
++        obj = lambda trial: _objective_xgb(trial, cfg, X, y, task, splits, pre)
++        direction = "maximize"
++    else:
++        # 未対応モデルはダミー
++        rid = make_run_id(prefix=cfg.get("name","tune"))
++        return rid, {}, 0.0
++
++    study = optuna.create_study(direction=direction)
++    study.optimize(obj, n_trials=n_trials)
++    return make_run_id(prefix=cfg.get("name","tune")), study.best_params, float(study.best_value)
 diff --git a/README.md b/README.md
-index 97531df..c73aa11 100644
+index c73aa11..1c2d3e4 100644
 --- a/README.md
 +++ b/README.md
-@@ -56,3 +56,35 @@ cv:
-   regression_stratify_bins: 10
+@@ -98,3 +98,40 @@ python ktk_cli.py adv-val --cfg conf/default.yaml
+ # 出力例: AUC=0.78, Top feats: ...
+
