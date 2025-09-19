@@ -1,190 +1,244 @@
+# リポジトリルートで実行（70KBベース）
+cat > pro-upgrades.patch << 'PATCH'
 *** ここから下をそのまま貼ってください ***
-diff --git a/src/validation.py b/src/validation.py
-index 1b2c3d4..9abcde0 100644
---- a/src/validation.py
-+++ b/src/validation.py
-@@ -1,8 +1,9 @@
- from __future__ import annotations
--import numpy as np
--from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
-+import numpy as np
-+from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
+diff --git a/ktk_cli.py b/ktk_cli.py
+index 4b2f6d1..8f0a1d2 100644
+--- a/ktk_cli.py
++++ b/ktk_cli.py
+@@ -1,6 +1,7 @@
+ import typer, yaml
+ from pathlib import Path
+ from src.core.registry import get_trainer, get_inferer
++from src.utils import ROOT
+ from src.tune import run_tuning
+ from src.utils import make_run_id
  
--def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True, random_state=42):
-+def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True, random_state=42,
-+                regression_stratify_bins: int = 10):
-     if method in ["stratified", "stratifiedkfold"] or (task == "classification" and method == "kfold"):
-         splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
-         return list(splitter.split(np.zeros(len(y)), y))
-@@ -12,5 +13,14 @@ def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True
-         return list(splitter.split(np.zeros(len(y)), y, groups))
-     if method == "time":
-         splitter = TimeSeriesSplit(n_splits=folds)
-         return list(splitter.split(np.arange(len(y))))
--    splitter = KFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
--    return list(splitter.split(np.zeros(len(y))))
-+    # regression with stratified-like binning
-+    if task != "classification" and method in ["stratified", "stratifiedkfold"]:
-+        y = np.array(y)
-+        q = max(2, regression_stratify_bins)
-+        bins = np.unique(np.quantile(y, np.linspace(0, 1, q+1)))
-+        yb = np.digitize(y, bins[1:-1], right=True)
-+        splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
-+        return list(splitter.split(np.zeros(len(y)), yb))
-+    splitter = KFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
-+    return list(splitter.split(np.zeros(len(y))))
-diff --git a/src/tabular/fe.py b/src/tabular/fe.py
+@@ -68,6 +69,35 @@ def eda_report(cfg: str = typer.Option("conf/default.yaml"),
+     path = generate_report(config, out_dir=out_dir, sample=sample)
+     typer.echo(f"[TurboKit] EDA report -> {path}")
+ 
++@app.command("threshold")
++def threshold_opt(
++    run_id: str = typer.Option(..., help="Run ID (OOF必須)"),
++    metric: str = typer.Option("f1", help="f1 | acc"),
++    step: float = typer.Option(0.001, help="探索刻み(0-1)"),
++    out_name: str = typer.Option(None, help="保存先CSV名（未指定で preds/<run_id>_thres.csv）"),
++    cfg: str = typer.Option("conf/default.yaml", help="Config（出力dir取得に使用）"),
++):
++    from src.postprocess.threshold import optimize_threshold
++    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
++    out = optimize_threshold(config, run_id, metric=metric, step=step, out_name=out_name)
++    typer.echo(f"[TurboKit] Thresholded submission -> {out}")
++
++@app.command("calibrate")
++def calibrate_probs(
++    run_id: str = typer.Option(..., help="Run ID (OOF必須)"),
++    method: str = typer.Option("platt", help="platt | isotonic"),
++    cfg: str = typer.Option("conf/default.yaml", help="Config"),
++):
++    from src.postprocess.calibration import fit_and_apply_calibration
++    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
++    out = fit_and_apply_calibration(config, run_id, method=method)
++    typer.echo(f"[TurboKit] Calibrated submission -> {out}")
++
++@app.command("adv-val")
++def adv_val(cfg: str = typer.Option("conf/default.yaml", help="Config YAML")):
++    from src.quality.adversarial import run_adversarial_validation
++    config = yaml.safe_load(open(cfg, "r", encoding="utf-8"))
++    rep = run_adversarial_validation(config)
++    typer.echo(f"[TurboKit] Adversarial AUC={rep['auc']:.4f}  Top feats: {', '.join(rep['top_features'][:10])}")
++
+ if __name__ == "__main__":
+     app()
+diff --git a/src/postprocess/threshold.py b/src/postprocess/threshold.py
 new file mode 100644
-index 0000000..f00baa1
+index 0000000..a11b2c3
 --- /dev/null
-+++ b/src/tabular/fe.py
-@@ -0,0 +1,94 @@
++++ b/src/postprocess/threshold.py
+@@ -0,0 +1,86 @@
 +from __future__ import annotations
-+from dataclasses import dataclass
-+from typing import Dict, Tuple, List, Optional
++from pathlib import Path
 +import numpy as np
 +import pandas as pd
++from ..utils import ROOT
 +
-+@dataclass
-+class OOFResult:
-+    train_enc: pd.Series
-+    test_enc: pd.Series
-+    mapping: Dict[str, float]
++def _search_threshold(y_true: np.ndarray, proba: np.ndarray, metric: str = "f1", step: float = 0.001):
++    assert metric in ("f1", "acc")
++    best_t, best_s = 0.5, -1.0
++    thr = np.arange(0.0, 1.0+1e-12, step)
++    for t in thr:
++        pred = (proba >= t).astype(int)
++        if metric == "f1":
++            # 手計算でF1（sklearn不要）
++            tp = ((pred == 1) & (y_true == 1)).sum()
++            fp = ((pred == 1) & (y_true == 0)).sum()
++            fn = ((pred == 0) & (y_true == 1)).sum()
++            p = 0.0 if (tp+fp)==0 else tp/(tp+fp)
++            r = 0.0 if (tp+fn)==0 else tp/(tp+fn)
++            f1 = 0.0 if (p+r)==0 else 2*p*r/(p+r)
++            s = f1
++        else:
++            s = (pred == y_true).mean()
++        if s > best_s:
++            best_s, best_t = s, t
++    return float(best_t), float(best_s)
 +
-+def _smoothing(count, global_mean, cat_mean, m=5.0):
-+    return (count * cat_mean + m * global_mean) / (count + m)
++def optimize_threshold(cfg: dict, run_id: str, metric: str = "f1", step: float = 0.001, out_name: str | None = None):
++    """
++    前提：OOFに 'oof_prob' がある(二値分類)。それを使って最適な閾値を探索し、
++          既存の test 予測CSV (outputs/preds/<run_id>.csv) の確率列 or 予測列を閾値で binarize して出力。
++    """
++    out_dir = ROOT / cfg["output"]["dir"]
++    oof_path = out_dir / "oof" / f"{run_id}.csv"
++    pred_path = out_dir / "preds" / f"{run_id}.csv"
++    assert oof_path.exists(), f"OOF not found: {oof_path}"
++    assert pred_path.exists(), f"Pred not found: {pred_path}"
 +
-+def oof_target_encode(
-+    X_train: pd.Series,
-+    y: pd.Series,
-+    X_test: Optional[pd.Series],
-+    folds: List[Tuple[np.ndarray, np.ndarray]],
-+    task: str = "regression",
-+    m: float = 20.0,
-+) -> OOFResult:
-+    """Leak-free (OOF) target encoding for a single categorical column."""
-+    x = X_train.astype(str).fillna("__NA__")
-+    if task == "classification":
-+        classes = sorted(pd.unique(y))
-+        if len(classes) != 2:
-+            raise ValueError("oof_target_encode classification expects binary target")
-+        pos = classes[-1]
-+        y_bin = (y == pos).astype(float)
-+        global_mean = float(y_bin.mean())
++    oof = pd.read_csv(oof_path)
++    assert "oof_prob" in oof.columns, "oof_prob is required for threshold optimization (binary)."
++    y_true = (oof["y"].values).astype(int)
++    proba = oof["oof_prob"].values.astype(float)
++    t, score = _search_threshold(y_true, proba, metric=metric, step=step)
++
++    sub = pd.read_csv(pred_path)
++    label = sub.columns[-1]
++    if sub[label].between(0.0, 1.0).all():
++        # すでに確率なら二値化
++        sub[label] = (sub[label].values >= t).astype(int)
 +    else:
-+        y_bin = y.astype(float)
-+        global_mean = float(y_bin.mean())
++        # 予測が 0/1 の場合は一旦確率列が必要…だがここではそのまま二値のままにする。
++        pass
 +
-+    oof = pd.Series(np.nan, index=x.index, dtype=float)
-+    for tr_idx, va_idx in folds:
-+        tr_x, tr_y = x.iloc[tr_idx], y_bin.iloc[tr_idx]
-+        stats = tr_x.groupby(tr_x).agg(["size"])
-+        means = tr_y.groupby(tr_x).mean()
-+        tmp = pd.concat([stats["size"], means], axis=1)
-+        tmp.columns = ["cnt", "mean"]
-+        tmp["enc"] = _smoothing(tmp["cnt"], global_mean, tmp["mean"], m=m)
-+        mapping = tmp["enc"].to_dict()
-+        oof.iloc[va_idx] = x.iloc[va_idx].map(mapping).fillna(global_mean).values
++    out_csv = out_dir / "preds" / (out_name or f"{run_id}_thres_{metric}.csv")
++    sub.to_csv(out_csv, index=False)
++    # 閾値のメモを残す
++    (out_csv.with_suffix(".meta.txt")).write_text(f"best_threshold={t}\nscore={score}\nmetric={metric}\n", encoding="utf-8")
++    return str(out_csv)
+diff --git a/src/postprocess/calibration.py b/src/postprocess/calibration.py
+new file mode 100644
+index 0000000..a22b3c4
+--- /dev/null
++++ b/src/postprocess/calibration.py
+@@ -0,0 +1,93 @@
++from __future__ import annotations
++from pathlib import Path
++import numpy as np
++import pandas as pd
++from sklearn.linear_model import LogisticRegression
++from sklearn.isotonic import IsotonicRegression
++from ..utils import ROOT
 +
-+    stats_full = x.groupby(x).agg(["size"])
-+    means_full = y_bin.groupby(x).mean()
-+    tmp_full = pd.concat([stats_full["size"], means_full], axis=1)
-+    tmp_full.columns = ["cnt", "mean"]
-+    tmp_full["enc"] = _smoothing(tmp_full["cnt"], global_mean, tmp_full["mean"], m=m)
-+    mapping_full = tmp_full["enc"].to_dict()
++def _fit_platt(y_true: np.ndarray, p: np.ndarray):
++    # Platt scaling: ロジスティック回帰で確率を校正
++    lr = LogisticRegression(max_iter=1000)
++    lr.fit(p.reshape(-1,1), y_true.astype(int))
++    def f(x): 
++        proba = lr.predict_proba(np.asarray(x).reshape(-1,1))[:,1]
++        return proba
++    return f
 +
-+    if X_test is not None:
-+        xt = X_test.astype(str).fillna("__NA__")
-+        test_enc = xt.map(mapping_full).fillna(global_mean)
++def _fit_isotonic(y_true: np.ndarray, p: np.ndarray):
++    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
++    iso.fit(p, y_true.astype(int))
++    def f(x):
++        return iso.predict(np.asarray(x))
++    return f
++
++def fit_and_apply_calibration(cfg: dict, run_id: str, method: str = "platt"):
++    """OOFの確率を用いてキャリブレータを学習し、test予測CSVを校正して出力。"""
++    out_dir = ROOT / cfg["output"]["dir"]
++    oof_path = out_dir / "oof" / f"{run_id}.csv"
++    pred_path = out_dir / "preds" / f"{run_id}.csv"
++    assert oof_path.exists(), f"OOF not found: {oof_path}"
++    assert pred_path.exists(), f"Pred not found: {pred_path}"
++    oof = pd.read_csv(oof_path)
++    assert "oof_prob" in oof.columns, "oof_prob is required for calibration (binary)."
++    y_true = (oof["y"].values).astype(int)
++    p = oof["oof_prob"].values.astype(float)
++    if method == "platt":
++        g = _fit_platt(y_true, p)
++    elif method == "isotonic":
++        g = _fit_isotonic(y_true, p)
 +    else:
-+        test_enc = pd.Series(dtype=float)
++        raise ValueError("method must be platt|isotonic")
++    sub = pd.read_csv(pred_path)
++    label = sub.columns[-1]
++    # testの列が確率でない場合はそのまま返す（確率モデル前提）
++    if not sub[label].between(0.0, 1.0).all():
++        return str(pred_path)
++    sub[label] = g(sub[label].values)
++    out = out_dir / "preds" / f"{run_id}_cal_{method}.csv"
++    sub.to_csv(out, index=False)
++    return str(out)
+diff --git a/src/quality/adversarial.py b/src/quality/adversarial.py
+new file mode 100644
+index 0000000..b33c4d5
+--- /dev/null
++++ b/src/quality/adversarial.py
+@@ -0,0 +1,109 @@
++from __future__ import annotations
++from pathlib import Path
++import numpy as np
++import pandas as pd
++from sklearn.model_selection import train_test_split
++from sklearn.metrics import roc_auc_score
++from sklearn.compose import ColumnTransformer
++from sklearn.preprocessing import OneHotEncoder, StandardScaler
++from sklearn.impute import SimpleImputer
++from sklearn.pipeline import Pipeline
++from sklearn.linear_model import LogisticRegression
 +
-+    return OOFResult(train_enc=oof, test_enc=test_enc, mapping=mapping_full)
++def _prep(train: pd.DataFrame, test: pd.DataFrame, target: str | None):
++    # 共通列のみ、ターゲットは除外
++    common = [c for c in train.columns if c in test.columns]
++    if target and target in common:
++        common.remove(target)
++    X = pd.concat([train[common].copy(), test[common].copy()], axis=0, ignore_index=True)
++    y = np.r_[np.zeros(len(train)), np.ones(len(test))]
++    return X, y, common
 +
-+def add_numeric_interactions(df: pd.DataFrame, cols: List[str], degree: int = 2, limit: int = 30) -> pd.DataFrame:
-+    """Add pairwise interaction x_i * x_j for up to `limit` numeric columns."""
-+    import itertools
-+    cols = [c for c in cols if c in df.columns][:limit]
-+    out = df.copy()
-+    for a, b in itertools.combinations(cols, 2):
-+        out[f"{a}__x__{b}"] = df[a].astype(float) * df[b].astype(float)
-+    return out
-diff --git a/src/train.py b/src/train.py
-index 1234567..89abcde 100644
---- a/src/train.py
-+++ b/src/train.py
-@@ -9,7 +9,8 @@ from sklearn.pipeline import Pipeline as SkPipe
- 
- from .utils import seed_everything, ensure_dirs, save_json, ROOT
- from .validation import make_splits
--from .preprocessing import build_preprocess
-+from .preprocessing import build_preprocess
-+from .tabular.fe import oof_target_encode, add_numeric_interactions
- from .models import ModelRegistry
- from .metrics import score_task
- from .logger import RunLogger
-@@ -23,9 +24,16 @@ def run_training(cfg: dict, run_id: str):
- 
--    pre, *_ = build_preprocess(train, target, id_col)
--    y = train[target].values
--    X = train.drop(columns=[c for c in [target, id_col] if c in train.columns])
-+    pre, *_ = build_preprocess(train, target, id_col)
-+    y = train[target].values
-+    X = train.drop(columns=[c for c in [target, id_col] if c in train.columns]).copy()
-+
-+    # Competition-focused features
-+    feats_cfg = cfg.get('features', {})
-+    if feats_cfg.get('interactions', False):
-+        num_cols = X.select_dtypes(include=['number']).columns.tolist()
-+        X = add_numeric_interactions(X, num_cols, degree=2, limit=int(feats_cfg.get('interactions_limit', 30)))
- 
--    splits = make_splits(task, y, method=cfg["cv"].get("method", "kfold"), folds=cfg["cv"].get("folds", 5),
--                         shuffle=cfg["cv"].get("shuffle", True), random_state=cfg["cv"].get("random_state", 42))
-+    splits = make_splits(task, y, method=cfg["cv"].get("method", "kfold"), folds=cfg["cv"].get("folds", 5),
-+                         shuffle=cfg["cv"].get("shuffle", True), random_state=cfg["cv"].get("random_state", 42),
-+                         regression_stratify_bins=int(cfg['cv'].get('regression_stratify_bins', 10)))
-@@ -40,7 +48,23 @@ def run_training(cfg: dict, run_id: str):
--        pipe = SkPipe([("pre", pre), ("est", est)]); pipe.fit(X_tr, y_tr)
-+        # OOF Target Encoding (binary clf/regression)
-+        if feats_cfg.get('target_encoding', False):
-+            obj_cols = [c for c in X.columns if X[c].dtype == 'O']
-+            if obj_cols:
-+                import pandas as pd
-+                # compute mappings once using full data & CV folds (leak-free)
-+                enc_maps = {}
-+                for c in obj_cols:
-+                    enc = oof_target_encode(X[c], pd.Series(y), None, folds=splits,
-+                                            task=('classification' if task=='classification' else 'regression'),
-+                                            m=float(feats_cfg.get('te_smoothing', 20.0)))
-+                    enc_maps[c] = enc.mapping
-+                X_tr = X_tr.copy(); X_va = X_va.copy()
-+                for c, mp in enc_maps.items():
-+                    X_tr[c+"__te"] = X_tr[c].astype(str).map(mp)
-+                    X_va[c+"__te"] = X_va[c].astype(str).map(mp)
-+        pipe = SkPipe([("pre", pre), ("est", est)]); pipe.fit(X_tr, y_tr)
++def run_adversarial_validation(cfg: dict) -> dict:
++    """train=0/test=1 の2値分類を作って AUC を測る。高いほど分布差が大きい。"""
++    train = pd.read_csv(Path(cfg["data"]["train"]).resolve())
++    test = pd.read_csv(Path(cfg["data"]["test"]).resolve())
++    target = cfg["data"].get("target")
++    X, y, cols = _prep(train, test, target)
++    num_cols = X.select_dtypes(include=["number"]).columns.tolist()
++    cat_cols = [c for c in X.columns if c not in num_cols]
++    num_pipe = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler(with_mean=False))])
++    cat_pipe = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", sparse=True))])
++    pre = ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
++    model = LogisticRegression(max_iter=1000)
++    pipe = Pipeline([("pre", pre), ("est", model)])
++    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
++    pipe.fit(Xtr, ytr)
++    prob = pipe.predict_proba(Xva)[:,1]
++    auc = roc_auc_score(yva, prob)
++    # 重みの絶対値上位を簡易に抽出（OneHot後の名前は取得が難しいので近似：元列単位での寄与を計算）
++    # ここでは数値：|coef|、カテゴリ：OneHot各カテゴリの|coef|の合計 で近似評価
++    est = pipe.named_steps["est"]
++    # ColumnTransformerの出力に対応する元列単位の寄与を近似集計
++    contrib = {}
++    # 数値側：列順は num_cols の順に標準化→線形回帰係数を割当（近似）
++    # OneHot 側は元列に複数カテゴリが展開されるため合計で寄与を見積もる。
++    # 厳密な列名復元は避け、簡易に num_cols と cat_cols の2ブロックに均等配分する近似。
++    coef = est.coef_.ravel() if hasattr(est, "coef_") else None
++    if coef is not None:
++        # 係数長の半分を数値、半分をカテゴリにざっくり配分（安全策）
++        # 実装を簡潔に保つための近似。目的は“上位候補”の把握。
++        k = len(coef)
++        k_num = min(len(num_cols), k)
++        coef_num = np.abs(coef[:k_num]).sum() if k_num>0 else 0.0
++        coef_cat = np.abs(coef[k_num:]).sum() if k>k_num else 0.0
++        for c in num_cols:
++            contrib[c] = contrib.get(c, 0.0) + (coef_num/len(num_cols) if len(num_cols)>0 else 0.0)
++        for c in cat_cols:
++            contrib[c] = contrib.get(c, 0.0) + (coef_cat/len(cat_cols) if len(cat_cols)>0 else 0.0)
++    top = sorted(contrib.items(), key=lambda x: x[1], reverse=True)
++    return {"auc": float(auc), "top_features": [t[0] for t in top]}
 diff --git a/README.md b/README.md
-index 2468ace..97531df 100644
+index 97531df..c73aa11 100644
 --- a/README.md
 +++ b/README.md
-@@ -1,3 +1,29 @@
-+## Competition-focused features
-+- **OOF Target Encoding**（リークなし・平滑化 `m`）
-+- **Regression Stratified CV**（回帰でも分位ビンで擬似層化）
-+- **Numeric Interactions**（ペア積で相互作用を自動作成）
-+
-+### 使い方（confに追記）
-+```yaml
-+features:
-+  target_encoding: true
-+  te_smoothing: 20.0   # 平滑化m（大きいほど全体平均に寄る）
-+  interactions: true
-+  interactions_limit: 30  # 相互作用を作る数値列上限
-+cv:
-+  method: stratified     # 回帰でも擬似層化CVが使えます
-+  regression_stratify_bins: 10
-+```
-*** ここまで ***
-PATCH
-
-git apply comp-upgrade.patch
-git commit -am "feat: OOF target encoding + regression stratified CV + numeric interactions"
+@@ -56,3 +56,35 @@ cv:
+   regression_stratify_bins: 10
