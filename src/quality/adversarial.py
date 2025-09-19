@@ -26,7 +26,7 @@ def run_adversarial_validation(cfg: dict) -> dict:
     num_cols = X.select_dtypes(include=["number"]).columns.tolist()
     cat_cols = [c for c in X.columns if c not in num_cols]
     num_pipe = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler(with_mean=False))])
-    cat_pipe = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", sparse=True))])
+    cat_pipe = Pipeline([("imp", SimpleImputer(strategy="most_frequent")), ("oh", OneHotEncoder(handle_unknown="ignore", sparse_output=True))])
     pre = ColumnTransformer([("num", num_pipe, num_cols), ("cat", cat_pipe, cat_cols)])
     model = LogisticRegression(max_iter=1000)
     pipe = Pipeline([("pre", pre), ("est", model)])
