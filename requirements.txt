@@ -18,3 +18,5 @@ pillow
 transformers
 accelerate
 sentencepiece
+
+shap
