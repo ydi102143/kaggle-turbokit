@@ -1,0 +1,10 @@
+{
+  "task": "regression",
+  "run_id": "toy_tabular_1758212973",
+  "model": "lightgbm",
+  "scores": {
+    "rmse": 1.214729874873814
+  },
+  "target": "y",
+  "id_col": "Id"
+}

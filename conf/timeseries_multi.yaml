@@ -1,0 +1,22 @@
+
+name: toy_ts_multi
+task: timeseries
+data:
+  train: data/tsm_train.csv
+  test: data/tsm_test.csv
+  sample_submission: data/tsm_sample_submission.csv
+  id_col: series_id
+  datetime_col: date
+  target: y
+  history: data/tsm_history.csv
+cv:
+  folds: 5
+  embargo: 5
+model:
+  name: lightgbm
+  params:
+    n_estimators: 600
+    learning_rate: 0.05
+output:
+  dir: outputs
+  label: prediction

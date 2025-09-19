@@ -1,0 +1,22 @@
+
+name: toy_tabular
+task: regression
+data:
+  train: data/train.csv
+  test: data/test.csv
+  sample_submission: data/sample_submission.csv
+  id_col: Id
+  target: y
+cv:
+  method: kfold
+  folds: 5
+  shuffle: true
+  random_state: 42
+model:
+  name: lightgbm
+  params:
+    n_estimators: 600
+    learning_rate: 0.05
+output:
+  dir: outputs
+  label: prediction

@@ -1,0 +1,21 @@
+
+name: toy_ts
+task: timeseries
+data:
+  train: data/ts_train.csv
+  test: data/ts_test.csv
+  sample_submission: data/ts_sample_submission.csv
+  id_col: Id
+  datetime_col: date
+  target: y
+cv:
+  folds: 5
+  embargo: 0
+model:
+  name: lightgbm
+  params:
+    n_estimators: 600
+    learning_rate: 0.05
+output:
+  dir: outputs
+  label: prediction

@@ -1,0 +1,22 @@
+
+name: toy_image
+task: image
+data:
+  train: data/img_train.csv
+  test: data/img_test.csv
+  image_root: data/images
+  path_col: image_path
+  label_col: label
+cv:
+  val_ratio: 0.2
+  random_state: 42
+model:
+  name: resnet18
+train:
+  epochs: 1
+  batch_size: 8
+  lr: 0.0005
+  img_size: 128
+output:
+  dir: outputs
+  label: prediction
