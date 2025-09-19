@@ -1,0 +1,190 @@
+*** ここから下をそのまま貼ってください ***
+diff --git a/src/validation.py b/src/validation.py
+index 1b2c3d4..9abcde0 100644
+--- a/src/validation.py
++++ b/src/validation.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+-import numpy as np
+-from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
++import numpy as np
++from sklearn.model_selection import KFold, StratifiedKFold, GroupKFold, TimeSeriesSplit
+ 
+-def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True, random_state=42):
++def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True, random_state=42,
++                regression_stratify_bins: int = 10):
+     if method in ["stratified", "stratifiedkfold"] or (task == "classification" and method == "kfold"):
+         splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
+         return list(splitter.split(np.zeros(len(y)), y))
+@@ -12,5 +13,14 @@ def make_splits(task: str, y, groups=None, method="kfold", folds=5, shuffle=True
+         return list(splitter.split(np.zeros(len(y)), y, groups))
+     if method == "time":
+         splitter = TimeSeriesSplit(n_splits=folds)
+         return list(splitter.split(np.arange(len(y))))
+-    splitter = KFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
+-    return list(splitter.split(np.zeros(len(y))))
++    # regression with stratified-like binning
++    if task != "classification" and method in ["stratified", "stratifiedkfold"]:
++        y = np.array(y)
++        q = max(2, regression_stratify_bins)
++        bins = np.unique(np.quantile(y, np.linspace(0, 1, q+1)))
++        yb = np.digitize(y, bins[1:-1], right=True)
++        splitter = StratifiedKFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
++        return list(splitter.split(np.zeros(len(y)), yb))
++    splitter = KFold(n_splits=folds, shuffle=shuffle, random_state=random_state)
++    return list(splitter.split(np.zeros(len(y))))
+diff --git a/src/tabular/fe.py b/src/tabular/fe.py
+new file mode 100644
+index 0000000..f00baa1
+--- /dev/null
++++ b/src/tabular/fe.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++from dataclasses import dataclass
++from typing import Dict, Tuple, List, Optional
++import numpy as np
++import pandas as pd
++
++@dataclass
++class OOFResult:
++    train_enc: pd.Series
++    test_enc: pd.Series
++    mapping: Dict[str, float]
++
++def _smoothing(count, global_mean, cat_mean, m=5.0):
++    return (count * cat_mean + m * global_mean) / (count + m)
++
++def oof_target_encode(
++    X_train: pd.Series,
++    y: pd.Series,
++    X_test: Optional[pd.Series],
++    folds: List[Tuple[np.ndarray, np.ndarray]],
++    task: str = "regression",
++    m: float = 20.0,
++) -> OOFResult:
++    """Leak-free (OOF) target encoding for a single categorical column."""
++    x = X_train.astype(str).fillna("__NA__")
++    if task == "classification":
++        classes = sorted(pd.unique(y))
++        if len(classes) != 2:
++            raise ValueError("oof_target_encode classification expects binary target")
++        pos = classes[-1]
++        y_bin = (y == pos).astype(float)
++        global_mean = float(y_bin.mean())
++    else:
++        y_bin = y.astype(float)
++        global_mean = float(y_bin.mean())
++
++    oof = pd.Series(np.nan, index=x.index, dtype=float)
++    for tr_idx, va_idx in folds:
++        tr_x, tr_y = x.iloc[tr_idx], y_bin.iloc[tr_idx]
++        stats = tr_x.groupby(tr_x).agg(["size"])
++        means = tr_y.groupby(tr_x).mean()
++        tmp = pd.concat([stats["size"], means], axis=1)
++        tmp.columns = ["cnt", "mean"]
++        tmp["enc"] = _smoothing(tmp["cnt"], global_mean, tmp["mean"], m=m)
++        mapping = tmp["enc"].to_dict()
++        oof.iloc[va_idx] = x.iloc[va_idx].map(mapping).fillna(global_mean).values
++
++    stats_full = x.groupby(x).agg(["size"])
++    means_full = y_bin.groupby(x).mean()
++    tmp_full = pd.concat([stats_full["size"], means_full], axis=1)
++    tmp_full.columns = ["cnt", "mean"]
++    tmp_full["enc"] = _smoothing(tmp_full["cnt"], global_mean, tmp_full["mean"], m=m)
++    mapping_full = tmp_full["enc"].to_dict()
++
++    if X_test is not None:
++        xt = X_test.astype(str).fillna("__NA__")
++        test_enc = xt.map(mapping_full).fillna(global_mean)
++    else:
++        test_enc = pd.Series(dtype=float)
++
++    return OOFResult(train_enc=oof, test_enc=test_enc, mapping=mapping_full)
++
++def add_numeric_interactions(df: pd.DataFrame, cols: List[str], degree: int = 2, limit: int = 30) -> pd.DataFrame:
++    """Add pairwise interaction x_i * x_j for up to `limit` numeric columns."""
++    import itertools
++    cols = [c for c in cols if c in df.columns][:limit]
++    out = df.copy()
++    for a, b in itertools.combinations(cols, 2):
++        out[f"{a}__x__{b}"] = df[a].astype(float) * df[b].astype(float)
++    return out
+diff --git a/src/train.py b/src/train.py
+index 1234567..89abcde 100644
+--- a/src/train.py
++++ b/src/train.py
+@@ -9,7 +9,8 @@ from sklearn.pipeline import Pipeline as SkPipe
+ 
+ from .utils import seed_everything, ensure_dirs, save_json, ROOT
+ from .validation import make_splits
+-from .preprocessing import build_preprocess
++from .preprocessing import build_preprocess
++from .tabular.fe import oof_target_encode, add_numeric_interactions
+ from .models import ModelRegistry
+ from .metrics import score_task
+ from .logger import RunLogger
+@@ -23,9 +24,16 @@ def run_training(cfg: dict, run_id: str):
+ 
+-    pre, *_ = build_preprocess(train, target, id_col)
+-    y = train[target].values
+-    X = train.drop(columns=[c for c in [target, id_col] if c in train.columns])
++    pre, *_ = build_preprocess(train, target, id_col)
++    y = train[target].values
++    X = train.drop(columns=[c for c in [target, id_col] if c in train.columns]).copy()
++
++    # Competition-focused features
++    feats_cfg = cfg.get('features', {})
++    if feats_cfg.get('interactions', False):
++        num_cols = X.select_dtypes(include=['number']).columns.tolist()
++        X = add_numeric_interactions(X, num_cols, degree=2, limit=int(feats_cfg.get('interactions_limit', 30)))
+ 
+-    splits = make_splits(task, y, method=cfg["cv"].get("method", "kfold"), folds=cfg["cv"].get("folds", 5),
+-                         shuffle=cfg["cv"].get("shuffle", True), random_state=cfg["cv"].get("random_state", 42))
++    splits = make_splits(task, y, method=cfg["cv"].get("method", "kfold"), folds=cfg["cv"].get("folds", 5),
++                         shuffle=cfg["cv"].get("shuffle", True), random_state=cfg["cv"].get("random_state", 42),
++                         regression_stratify_bins=int(cfg['cv'].get('regression_stratify_bins', 10)))
+@@ -40,7 +48,23 @@ def run_training(cfg: dict, run_id: str):
+-        pipe = SkPipe([("pre", pre), ("est", est)]); pipe.fit(X_tr, y_tr)
++        # OOF Target Encoding (binary clf/regression)
++        if feats_cfg.get('target_encoding', False):
++            obj_cols = [c for c in X.columns if X[c].dtype == 'O']
++            if obj_cols:
++                import pandas as pd
++                # compute mappings once using full data & CV folds (leak-free)
++                enc_maps = {}
++                for c in obj_cols:
++                    enc = oof_target_encode(X[c], pd.Series(y), None, folds=splits,
++                                            task=('classification' if task=='classification' else 'regression'),
++                                            m=float(feats_cfg.get('te_smoothing', 20.0)))
++                    enc_maps[c] = enc.mapping
++                X_tr = X_tr.copy(); X_va = X_va.copy()
++                for c, mp in enc_maps.items():
++                    X_tr[c+"__te"] = X_tr[c].astype(str).map(mp)
++                    X_va[c+"__te"] = X_va[c].astype(str).map(mp)
++        pipe = SkPipe([("pre", pre), ("est", est)]); pipe.fit(X_tr, y_tr)
+diff --git a/README.md b/README.md
+index 2468ace..97531df 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,29 @@
++## Competition-focused features
++- **OOF Target Encoding**（リークなし・平滑化 `m`）
++- **Regression Stratified CV**（回帰でも分位ビンで擬似層化）
++- **Numeric Interactions**（ペア積で相互作用を自動作成）
++
++### 使い方（confに追記）
++```yaml
++features:
++  target_encoding: true
++  te_smoothing: 20.0   # 平滑化m（大きいほど全体平均に寄る）
++  interactions: true
++  interactions_limit: 30  # 相互作用を作る数値列上限
++cv:
++  method: stratified     # 回帰でも擬似層化CVが使えます
++  regression_stratify_bins: 10
++```
+*** ここまで ***
+PATCH
+
+git apply comp-upgrade.patch
+git commit -am "feat: OOF target encoding + regression stratified CV + numeric interactions"
